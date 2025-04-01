@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for deploying HunyuanVideo on AWS EC2'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: g4dn.xlarge
+    AllowedValues:
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g4dn.4xlarge
+      - g4dn.8xlarge
+      - p3.2xlarge
+      - p3.8xlarge
+      - p3.16xlarge
+    ConstraintDescription: Must be a valid GPU instance type.
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+
+  VpcId:
+    Description: VPC ID where the instance will be launched
+    Type: AWS::EC2::VPC::Id
+
+  SubnetId:
+    Description: Subnet ID where the instance will be launched
+    Type: AWS::EC2::Subnet::Id
+
+  SourceCidrForSSH:
+    Description: CIDR block for SSH access to the instance
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: Must be a valid CIDR range of the form x.x.x.x/x.
+
+  SourceCidrForWeb:
+    Description: CIDR block for web access to the instance
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: Must be a valid CIDR range of the form x.x.x.x/x.
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hunyuan-video-deployment-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt S3Bucket.Arn
+                  - !Sub '${S3Bucket.Arn}/*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for HunyuanVideo EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SourceCidrForSSH
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref SourceCidrForWeb
+          Description: HTTP access for status page
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: !Ref SourceCidrForWeb
+          Description: Gradio web app access
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update system packages
+          apt-get update
+          apt-get upgrade -y
+
+          # Install necessary packages
+          apt-get install -y git unzip awscli nginx
+
+          # Create app directory
+          mkdir -p /home/ubuntu/hunyuan-video
+          cd /home/ubuntu/hunyuan-video
+
+          # Install Docker
+          apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+          add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+
+          # Start Docker service
+          systemctl start docker
+          systemctl enable docker
+
+          # Add ubuntu user to docker group
+          usermod -aG docker ubuntu
+
+          # Install NVIDIA drivers and container toolkit
+          apt-get install -y linux-headers-$(uname -r)
+          distribution=$(. /etc/os-release;echo $ID$VERSION_ID | sed -e 's/\\.//g')
+          wget https://developer.download.nvidia.com/compute/cuda/repos/$distribution/x86_64/cuda-keyring_1.0-1_all.deb
+          dpkg -i cuda-keyring_1.0-1_all.deb
+          apt-get update
+          apt-get install -y cuda-drivers
+
+          # Install NVIDIA Container Toolkit
+          distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+          curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+          curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+          apt-get update
+          apt-get install -y nvidia-docker2
+          systemctl restart docker
+
+          # Clone the repository
+          git clone https://github.com/Tencent/HunyuanVideo.git /home/ubuntu/hunyuan-video
+          cd /home/ubuntu/hunyuan-video
+
+          # Create Docker build script
+          cat > /home/ubuntu/hunyuan-video/build_and_run.sh <<EOL
+          #!/bin/bash
+          # Script to build and run the HunyuanVideo Docker container
+
+          set -e
+
+          echo "=== Building and running HunyuanVideo Docker container ==="
+
+          # Set environment variables
+          APP_NAME="hunyuan-video"
+          APP_PORT=8081
+          HOST_PORT=8081
+
+          # Build the Docker image
+          docker build -t \$APP_NAME:latest .
+
+          # Check if a container with the same name is already running
+          if [ "\$(docker ps -q -f name=\$APP_NAME)" ]; then
+              echo "Stopping existing container..."
+              docker stop \$APP_NAME
+              docker rm \$APP_NAME
+          fi
+
+          # Check if a stopped container with the same name exists
+          if [ "\$(docker ps -aq -f status=exited -f name=\$APP_NAME)" ]; then
+              echo "Removing stopped container..."
+              docker rm \$APP_NAME
+          fi
+
+          echo "Running Docker container with GPU support..."
+          # Run the Docker container with GPU support
+          docker run -d \\
+              --name \$APP_NAME \\
+              --restart unless-stopped \\
+              --gpus all \\
+              -p \$HOST_PORT:\$APP_PORT \\
+              -v \$(pwd)/ckpts:/app/ckpts \\
+              -e SERVER_NAME=0.0.0.0 \\
+              -e SERVER_PORT=\$APP_PORT \\
+              \$APP_NAME:latest
+
+          echo "Container started. The application should be accessible at http://\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):\$HOST_PORT"
+          EOL
+
+          chmod +x /home/ubuntu/hunyuan-video/build_and_run.sh
+
+          # Create a script to run the application after reboot
+          cat > /home/ubuntu/run_hunyuan.sh <<EOL
+          #!/bin/bash
+          cd /home/ubuntu/hunyuan-video
+          ./build_and_run.sh
+          EOL
+
+          chmod +x /home/ubuntu/run_hunyuan.sh
+
+          # Add to crontab to run after reboot
+          (crontab -l 2>/dev/null; echo "@reboot /home/ubuntu/run_hunyuan.sh") | crontab -
+
+          # Create a simple status page
+          cat > /var/www/html/index.html <<EOL
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>HunyuanVideo Application</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
+                  h1 { color: #333; }
+                  .container { max-width: 800px; margin: 0 auto; }
+                  .button { display: inline-block; background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>HunyuanVideo Application</h1>
+                  <p>The Gradio application is running on this instance.</p>
+                  <p><a class="button" href="http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8081">Open Gradio App</a></p>
+              </div>
+          </body>
+          </html>
+          EOL
+
+          # Set ownership
+          chown -R ubuntu:ubuntu /home/ubuntu/hunyuan-video
+          chown ubuntu:ubuntu /home/ubuntu/run_hunyuan.sh
+
+          # Run the application
+          su - ubuntu -c "/home/ubuntu/run_hunyuan.sh"
+
+          # Signal successful completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: HunyuanVideo
+        - Key: Project
+          Value: HunyuanVideo
+      CreationPolicy:
+        ResourceSignal:
+          Timeout: PT30M
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c7217cdde317cfec  # Ubuntu 22.04 LTS in us-east-1
+    us-east-2:
+      AMI: ami-05fb0b8c1424f266b  # Ubuntu 22.04 LTS in us-east-2
+    us-west-1:
+      AMI: ami-0ce2cb35386fc22e9  # Ubuntu 22.04 LTS in us-west-1
+    us-west-2:
+      AMI: ami-008fe2fc65df48dac  # Ubuntu 22.04 LTS in us-west-2
+    eu-west-1:
+      AMI: ami-0694d931cee176e7d  # Ubuntu 22.04 LTS in eu-west-1
+    eu-west-2:
+      AMI: ami-0505148b3591e4c07  # Ubuntu 22.04 LTS in eu-west-2
+    eu-central-1:
+      AMI: ami-0faab6bdbac9486fb  # Ubuntu 22.04 LTS in eu-central-1
+    ap-northeast-1:
+      AMI: ami-0d52744d6551d851e  # Ubuntu 22.04 LTS in ap-northeast-1
+    ap-southeast-1:
+      AMI: ami-0df7a207adb9748c7  # Ubuntu 22.04 LTS in ap-southeast-1
+    ap-southeast-2:
+      AMI: ami-0310483fb2b488153  # Ubuntu 22.04 LTS in ap-southeast-2
+
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance
+
+  PublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+
+  WebsiteURL:
+    Description: URL for the status page
+    Value: !Sub 'http://${EC2Instance.PublicIp}'
+
+  GradioAppURL:
+    Description: URL for the Gradio application
+    Value: !Sub 'http://${EC2Instance.PublicIp}:8081'
+
+  SSHCommand:
+    Description: Command to SSH into the instance
+    Value: !Sub 'ssh -i ${KeyName}.pem ubuntu@${EC2Instance.PublicIp}'
